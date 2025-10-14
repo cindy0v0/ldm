@@ -6,3 +6,14 @@ playground.py
 playground1.py
 src/__pycache__/
 src/diffusers.egg-info/
+checkpoints/
+ddpm*
+logs/
+sai_logs/
+vq_logs/
+src/*.ckpt
+src/*.pth
+src/*.json
+script/
+images/
+wandb/
