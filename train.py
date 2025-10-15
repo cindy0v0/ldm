@@ -737,16 +737,9 @@ def main(args):
             resume_step = resume_global_step % (
                 num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
-    def tv_loss(x̂):
-        tv_loss = ((x̂[:, :, :, 1:] - x̂[:, :, :, :-1]).abs().mean() +
-                   (x̂[:, :, 1:, :] - x̂[:, :, :-1, :]).abs().mean())
-        return 1e-5 * tv_loss
-
     grads = 0.0
-    from collections import defaultdict
-    stats = defaultdict(float)
-    
-    loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False).to(accelerator.device)
+    # todo: 
+    loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False).to(torch.float32).to(accelerator.device)
     m = SSIM().to(accelerator.device)
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
