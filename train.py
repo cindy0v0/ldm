@@ -4,11 +4,12 @@ import logging
 import math
 import os
 import gc
+import time
+import random
 import shutil
 from datetime import timedelta
 from pathlib import Path
-from functools import partial
-from PIL import Image
+
 import lpips
 from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
 
@@ -17,14 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.resnet import Upsample2D
-from torch.fx import symbolic_trace
 
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
@@ -37,7 +36,9 @@ from diffusers.utils.import_utils import is_xformers_available
 from src.standardizer import ChannelStandardize
 from src.pipeline import *
 from src.resampler import *  # create_named_schedule_sampler
-from src.data import PathologyTrain, PathologyValidation
+from src.data import PathologyBase
+from src.timestep_range import TimestepRange
+from test import evaluate
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.27.0.dev0")
@@ -72,31 +73,10 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Simple example of a training script.")
     parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that HF Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
         "--model_config_name_or_path",
         type=str,
         default=None,
         help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
-    )
-    parser.add_argument(
-        "--blurr",
-        action="store_true",
-        help="Whether to use blurr upsampling. Defaults to bilinear interp otherwise",
     )
     parser.add_argument(
         "--vae_config",
@@ -114,12 +94,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--n_samples",
-        type=int,
-        default=None,
-        help="Number of samples for the training set, used for debugging purposes"
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
         default="ddpm-model-256",
@@ -131,6 +105,36 @@ def parse_args():
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
+    )
+    parser.add_argument("--push_to_hub", action="store_true",
+                        help="Whether or not to push the model to the Hub.")
+    parser.add_argument("--hub_token", type=str, default=None,
+                        help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        default=None,
+        help="The name of the repository to keep in sync with the local `output_dir`.",
+    )
+    parser.add_argument(
+        "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
+    )
+    # dataset params
+    parser.add_argument(
+        "--subtype", 
+        type=str,
+        default='cc',
+        help="The pathology subtype to use for training."
+    )
+    parser.add_argument(
+        "--color_norm",
+        action="store_true",
+        help="Whether to use color normalization augmentation. Defaults to False otherwise",
+    )
+    parser.add_argument(
+        "--n_samples",
+        type=int,
+        help="Number of samples for the training set, used for debugging purposes"
     )
     parser.add_argument(
         "--resolution",
@@ -176,12 +180,15 @@ def parse_args():
             " process."
         ),
     )
-    parser.add_argument("--num_epochs", type=int, default=150)
-    parser.add_argument("--save_images_epochs", type=int, default=10,
-                        help="How often to save images during training.")
     parser.add_argument(
-        "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
+        "--num_epochs", type=int, default=150)
+    parser.add_argument(
+        "--save_images_epochs", type=int, default=1, help="How often to save images during training.")
+    parser.add_argument(
+        "--save_model_epochs", type=int, default=1, help="How often to save the model during training."
     )
+    parser.add_argument(
+        "--validation_epochs", type=int, default=1, help="How often to validate the model during training.")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -226,19 +233,6 @@ def parse_args():
                         help="The power value for the EMA decay.")
     parser.add_argument("--ema_max_decay", type=float, default=0.9999,
                         help="The maximum decay magnitude for EMA.")
-    parser.add_argument("--push_to_hub", action="store_true",
-                        help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None,
-                        help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--hub_private_repo", action="store_true", help="Whether or not to create a private repository."
-    )
     parser.add_argument(
         "--logger",
         type=str,
@@ -248,6 +242,16 @@ def parse_args():
             "Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) or [wandb](https://www.wandb.ai)"
             " for experiment tracking and logging of model metrics and model checkpoints"
         ),
+    )
+    parser.add_argument(
+        '--project_name',
+        type=str,
+        default='ddpm-pathology',
+    )
+    parser.add_argument(
+        '--experiment_name',
+        type=str,
+        default='ddpm-pathology-experiment',
     )
     parser.add_argument(
         "--logging_dir",
@@ -263,7 +267,7 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="no",
+        default="bf16",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose"
@@ -278,14 +282,24 @@ def parse_args():
         choices=["epsilon", "sample", "v-prediction"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
+    parser.add_argument(
+        "--blurr",
+        action="store_true",
+        help="Whether to use blurr upsampling. Defaults to bilinear interp otherwise",
+    )
     parser.add_argument("--use_snr", action="store_true",
                         help="Whether to use SNR weighting for the loss.")
-    parser.add_argument("--snr_epochs", type=int, default=25,
-                        help="Number of epochs to use SNR weighting.")
+    parser.add_argument('--snr_weight', type=float, default=0.2)
+    parser.add_argument('--lpips_start_epoch', type=int)
+    parser.add_argument('--ssim_start_epoch', type=int)
     parser.add_argument("--use_lpips", action="store_true",
                         help="Whether to use LPIPS loss.")
+    parser.add_argument("--lpips_weight", type=float, default=1.0,
+                        help="The weight for the LPIPS loss.")
     parser.add_argument("--use_ssim", action="store_true",
                         help="Whether to use SSIM loss.")
+    parser.add_argument("--ssim_weight", type=float, default=1.0,
+                        help="The weight for the SSIM loss.")
     parser.add_argument("--use_resampling", action="store_true",
                         help="Whether to use resampling.")
     parser.add_argument("--gamma", type=float, default=5.0,
@@ -293,11 +307,14 @@ def parse_args():
     parser.add_argument("--noise_scheduler_type", type=str,
                         default="ddpm", help="The noise scheduler type to use.")
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_num_inference_steps", type=int, default=50)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--ddpm_beta_schedule", type=str,
                         default="squaredcos_cap_v2")
     parser.add_argument("--ddpm_beta_end", type=float, default=0.02)
-    parser.add_argument("--ddpm_noise_timesteps", type=int, default=350)
+    parser.add_argument("--ddpm_noise_timesteps", type=int, default=200)
+    parser.add_argument("--use_timestep_schedule", action="store_true",)
+    parser.add_argument("--truncated_train_timesteps", type=str, default=None, help="comma separated int timestep entries")
+    parser.add_argument("--timestep_schedule", type=str, default=None, help="comma separated int epoch entries")
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -350,20 +367,54 @@ def parse_args():
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    # if args.dataset_name is None and args.train_data_files is None and args.train_data_dir is None:
-    #     raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
+        
+    if args.use_timestep_schedule:
+        args.timestep_schedule = list(map(int, args.timestep_schedule.split(',')))
+        args.truncated_train_timesteps = list(map(int, args.truncated_train_timesteps.split(',')))
 
     return args
 
 
-def save_images(input: torch.Tensor):
-    # todo
-    pass
-    # clean_images = output['clean_images'].permute(0, 2, 3, 1)
-    # clean_images = (clean_images.to(torch.float32) / 2 +
-    #                 0.5).clamp(0, 1).cpu().numpy()
-    # clean_images = (clean_images * 255).round().astype("uint8")
+def set_seed(seed=42, deterministic=False):
+    """
+    Set seed for all random number generators to ensure reproducible results
+    
+    Args:
+        seed (int): Random seed value
+        deterministic (bool): Whether to use deterministic algorithms (slower but more reproducible)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # For multi-GPU setups
+    
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    if deterministic:
+        # Make operations deterministic (may reduce performance)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
+        # Set environment variable for deterministic algorithms
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        
+        # Enable deterministic algorithms (PyTorch >= 1.8)
+        try:
+            torch.use_deterministic_algorithms(True)
+        except AttributeError:
+            # Fallback for older PyTorch versions
+            torch.set_deterministic(True)
+    else:
+        # Allow non-deterministic but faster operations
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+    
+    print(f"Random seed set to {seed}")
+    if deterministic:
+        print("Deterministic mode enabled (may be slower)")
 
 
 def blurr_upsample(model):
@@ -577,18 +628,18 @@ def main(args):
         model = UNet2DModel.from_config(config)
     # attach_hook(model)
     
-    chan_std_ = torch.load("src/chan_std.pth")
-    mean, std = chan_std_["mean"], chan_std_["std"]
-    chan_std = ChannelStandardize(mean, std)
+    # chan_std_ = torch.load("src/chan_std.pth")
+    # mean, std = chan_std_["mean"], chan_std_["std"]
+    # chan_std = ChannelStandardize(mean, std)
     
-    in_adapter = nn.Conv2d(vae.config.latent_channels, vae.config.latent_channels, 1)
-    nn.init.dirac_(in_adapter.weight); nn.init.zeros_(in_adapter.bias)
+    # in_adapter = nn.Conv2d(vae.config.latent_channels, vae.config.latent_channels, 1)
+    # nn.init.dirac_(in_adapter.weight); nn.init.zeros_(in_adapter.bias)
 
-    if args.blurr:
-        blurr_upsample(model)
-    else:           
-        swap_conv3x3_to_1x1(model)
-        set_bilinear_upblock(model)
+    # if args.blurr:
+    #     blurr_upsample(model)
+    # else:           
+    #     swap_conv3x3_to_1x1(model)
+    #     set_bilinear_upblock(model)
 
     # Create EMA for the model.
     if args.use_ema:
@@ -638,7 +689,7 @@ def main(args):
     else:
         noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps,
                                         beta_schedule=args.ddpm_beta_schedule, beta_end=args.ddpm_beta_end)
-
+    
     resampler = create_named_schedule_sampler(
         'loss-second-moment', noise_scheduler)
 
@@ -651,12 +702,8 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    dataset = PathologyTrain(
-        size=256, n_samples=args.n_samples, jitter=args.jitter)
-    if args.debug:
-        with open(args.output_dir + '/image_paths.txt', 'w') as f:
-            for i in range(len(dataset)):
-                f.write(f"{dataset.data[i]}\n")
+    dataset = PathologyBase('train', subtype=args.subtype, size=args.resolution, color_norm=args.color_norm, n_samples=args.n_samples, jitter=args.jitter, random_flip=args.random_flip)
+    val_dataset = PathologyBase('validation', subtype=args.subtype, size=args.resolution, color_norm=args.color_norm, n_samples=args.n_samples)
 
     global_step = 0
     first_epoch = 0
@@ -667,23 +714,26 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, pin_memory=True
     )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.dataloader_num_workers
+    )
 
     # Initialize the learning rate scheduler
     lr_scheduler = get_scheduler(
-        "cosine",
+        args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps, # * args.gradient_accumulation_steps,
         num_training_steps=(len(train_dataloader) * args.num_epochs),
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler, in_adapter = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler, in_adapter
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
     )
-    if vae.config.latent_channels == mean.numel():
-        chan_std = accelerator.prepare(chan_std)
+    # if vae.config.latent_channels == mean.numel():
+    #     chan_std = accelerator.prepare(chan_std)
 
-    vae = vae.to(accelerator.device, dtype=weight_dtype)
+    vae = vae.to(accelerator.device) # dtype=weight_dtype
 
     if args.use_ema:
         ema_model.to(accelerator.device)
@@ -692,7 +742,11 @@ def main(args):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         run = os.path.split(__file__)[-1].split(".")[0]
-        accelerator.init_trackers(run)
+        accelerator.init_trackers(
+            project_name=args.project_name, 
+            config=args,
+            init_kwargs={"wandb": {"name": args.experiment_name}}
+        )
 
     total_batch_size = args.train_batch_size * \
         accelerator.num_processes * args.gradient_accumulation_steps
@@ -738,9 +792,16 @@ def main(args):
                 num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     grads = 0.0
-    # todo: 
     loss_fn_vgg = lpips.LPIPS(net='vgg').requires_grad_(False).to(torch.float32).to(accelerator.device)
     m = SSIM().to(accelerator.device)
+    lpips_loss = torch.tensor([0.0])
+    omssim = torch.tensor([0.0])
+    
+    λ = args.snr_weight
+    best_auc = 0.0
+    
+    timestep_range = TimestepRange(args.truncated_train_timesteps, args.timestep_schedule) if args.use_timestep_schedule else None
+    test_batch = next(iter(val_dataloader)) if not args.num_epochs > 1000 else next(iter(train_dataloader))
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
         model.train()
@@ -755,7 +816,7 @@ def main(args):
                 continue
             torch.cuda.reset_peak_memory_stats()
 
-            clean_images = batch["input"].to(weight_dtype)
+            clean_images = batch["input"] 
             posterior = vae.encode(clean_images)
             if hasattr(posterior, 'latent_dist'):
                 latents = posterior.latent_dist.sample()
@@ -763,72 +824,61 @@ def main(args):
                 latents = posterior.latents
             latents = (latents - vae_shift) * vae.config.scaling_factor
 
-            if vae.config.latent_channels == mean.numel():
-                latents = chan_std(latents)
-            latents = in_adapter(latents)
-            
-            _temp = latents.permute(1,0,2,3).contiguous().view(vae.config.latent_channels,-1)
-            print("per-channel std ~", _temp.std(dim=1).mean().item())
-            
-            # Sample noise that we'll add to the images
+            # if vae.config.latent_channels == mean.numel():
+            #     latents = chan_std(latents)
+            # latents = in_adapter(latents)
+                        
             noise = torch.randn(
-                latents.shape, dtype=weight_dtype, device=latents.device)
-            bsz = latents.shape[0]  # batch size
-            # Sample a random timestep for each image
+                latents.shape, device=latents.device)
+            bsz = latents.shape[0]
+            train_timestep = timestep_range.timestep if args.use_timestep_schedule else noise_scheduler.num_train_timesteps
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                0, train_timestep, (bsz,), device=clean_images.device
             ).long()
+            
 
-            # Add noise to the clean images according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(
                 latents, noise, timesteps)
 
             with accelerator.accumulate(model):
-                # Predict the noise residual
-                noise_pred = model(noisy_latents, timesteps).sample
+                model_pred = model(noisy_latents, timesteps).sample
 
                 if args.prediction_type == "epsilon" and not args.use_snr and not args.use_resampling:
                     # this could have different weights!
-                    loss = F.mse_loss(noise_pred.float(), noise.float())
+                    loss = F.mse_loss(model_pred.float(), noise.float())
                 elif args.prediction_type == "epsilon" and args.use_snr:
-                    if epoch < args.snr_epochs:
-                        bsz = noise_pred.shape[0]
-                        alpha_t = _extract_into_tensor(
-                            noise_scheduler.alphas_cumprod, timesteps, (
-                                clean_images.shape[0], 1, 1, 1)
-                        )
-                        snr_weights = alpha_t / (1 - alpha_t)
-                        # https://medium.com/@wangdk93/min-snr-diffusion-training-289197810a9e
-                        snr_weights = torch.min(torch.tensor([1.]).to(snr_weights.device), torch.tensor(
-                            [float(args.gamma)]).to(snr_weights.device)/(snr_weights + 1e-9))
-                        snr_weights[snr_weights == 0] = 1.0
-                        loss = snr_weights * \
-                            F.mse_loss(noise_pred.float(),
-                                       noise.float(), reduction="none")
-                        # importance sampling
-                        loss = loss.mean(dim=[1, 2, 3])
-                        indices, weights = resampler.sample(
-                            bsz, noise_pred.device)
-                        resampler.update_with_all_losses(timesteps, loss)
-                        loss = loss * weights
-                        loss = loss.mean()
-                    else:
-                        # this could have different weights!
-                        loss = F.mse_loss(noise_pred.float(), noise.float())
+                    bsz = model_pred.shape[0]
+                    alpha_t = _extract_into_tensor(
+                        noise_scheduler.alphas_cumprod, timesteps, (
+                            clean_images.shape[0], 1, 1, 1)
+                    )
+                    snr_weights = alpha_t / (1 - alpha_t)
+                    # https://medium.com/@wangdk93/min-snr-diffusion-training-289197810a9e
+                    snr_weights = torch.min(torch.tensor([1.]).to(snr_weights.device), torch.tensor(
+                        [float(args.gamma)]).to(snr_weights.device)/(snr_weights + 1e-9))
+                    snr_weights[snr_weights == 0] = 1.0
+                    loss = snr_weights * \
+                        F.mse_loss(model_pred.float(),
+                                    noise.float(), reduction="none")
+                    # importance sampling
+                    loss = loss.mean(dim=[1, 2, 3])
+                    indices, weights = resampler.sample(
+                        bsz, model_pred.device)
+                    resampler.update_with_all_losses(timesteps, loss)
+                    loss = loss * weights
+                    loss = λ * loss.mean() + (1 - λ) * F.mse_loss(model_pred.float(), noise.float())
                 elif args.prediction_type == "epsilon" and args.use_resampling:
-                    bsz = noise_pred.shape[0]
-                    loss = F.mse_loss(noise_pred.float(
+                    bsz = model_pred.shape[0]
+                    loss = F.mse_loss(model_pred.float(
                     ), noise.float(), reduction="none")  # (B, C, H, W)
                     indices, weights = resampler.sample(
-                        bsz, noise_pred.device)
+                        bsz, model_pred.device)
                     resampler.update_with_all_losses(
                         timesteps, loss.mean(dim=[1, 2, 3]))
                     loss = loss.mean(dim=[1, 2, 3]) * weights
                     loss = loss.mean()
                 elif args.prediction_type == "v-prediction":
                     # v   = √α_t * ε − √(1−α_t) * x0
-                    # let the scheduler convert v_pred→ε_pred/x0_pred internally
                     # v prediction training objective from https://arxiv.org/abs/2202.09778
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (
@@ -836,18 +886,16 @@ def main(args):
                     )
                     sigma_t = torch.sqrt(1 - alpha_t)
                     target = torch.sqrt(alpha_t) * noise - sigma_t * latents
-                    loss = F.mse_loss(noise_pred.float(),
+                    loss = F.mse_loss(model_pred.float(),
                                       target.float(), reduction="none")
                     loss = loss.mean(dim=[1, 2, 3])
                     if args.use_snr:
-                        # todo: refactor to use snr fn from diffusers
                         snr_weights = alpha_t / (1 - alpha_t)
                         snr_weights = torch.min(torch.tensor([1.]).to(snr_weights.device), torch.tensor(
                             [float(args.gamma)]).to(snr_weights.device)/(snr_weights + 1e-9))
                         snr_weights[snr_weights == 0] = 1.0
                         loss = snr_weights * loss
                     loss = loss.mean()
-                    # loss += 1e-5 * 
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (
@@ -856,7 +904,7 @@ def main(args):
                     snr_weights = alpha_t / (1 - alpha_t)
                     # use SNR weighting from distillation paper
                     loss = snr_weights * \
-                        F.mse_loss(noise_pred.float(),
+                        F.mse_loss(model_pred.float(),
                                    clean_images.float(), reduction="none")
                     loss = loss.mean()
                 else:
@@ -867,26 +915,28 @@ def main(args):
                     noise_scheduler.alphas_cumprod, timesteps, (
                         clean_images.shape[0], 1, 1, 1)
                 )
-                if args.use_lpips and epoch >= args.snr_epochs:
+                if args.use_lpips and epoch >= args.lpips_start_epoch:
                     # generate x_0
                     if args.prediction_type == "epsilon":
                         pred_x0 = (noisy_latents - torch.sqrt(1 - alpha_t)
-                                   * noise_pred) / torch.sqrt(alpha_t)
+                                   * model_pred) / torch.sqrt(alpha_t)
                     elif args.prediction_type == "sample":
-                        pred_x0 = noise_pred
+                        pred_x0 = model_pred
                     lpips_loss = loss_fn_vgg(pred_x0, latents).mean()
-                    loss += 0.2 * lpips_loss
-                if args.use_ssim and epoch >= args.snr_epochs:
+                    lpips_weight = args.lpips_weight * (global_step - len(train_dataloader) * args.lpips_start_epoch) / (len(train_dataloader) * (args.num_epochs - args.lpips_start_epoch))
+                    loss += lpips_loss * lpips_weight
+                if args.use_ssim and epoch >= args.ssim_start_epoch:
                     if args.prediction_type == "epsilon":
                         pred_x0 = (noisy_latents - torch.sqrt(1 - alpha_t)
-                                   * noise_pred) / torch.sqrt(alpha_t)
+                                   * model_pred) / torch.sqrt(alpha_t)
                     elif args.prediction_type == "sample":
-                        pred_x0 = noise_pred
-                    pred_x0 = pred_x0.to(latents.dtype)
-                    loss += 0.5 * (1 - m(pred_x0, latents))
+                        pred_x0 = model_pred
+                    # pred_x0 = pred_x0.to(latents.dtype)
+                    omssim = (1 - m(pred_x0, latents))
+                    loss += 0.5 * omssim
 
                 # pred_x0 = (noisy_latents - torch.sqrt(1 - alpha_t)
-                #            * noise_pred) / torch.sqrt(alpha_t)
+                #            * model_pred) / torch.sqrt(alpha_t)
                 # loss += tv_loss(pred_x0)
 
                 accelerator.backward(loss)
@@ -943,15 +993,17 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch,
-                    "grads": grads, "lpips": lpips_loss.item() if (args.use_lpips and epoch >= args.snr_epochs) else 0.0,
-                    "peak memory": peak_memory, "reserved memory": res_memory, "allocated memory": alloc_memory}
+            logs = {"loss": loss.item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch,
+                    "grads": grads, "lpips": lpips_loss.item(), "omssim": omssim.item(),
+                    "peak memory": peak_memory, 
+                    "reserved memory": res_memory, 
+                    "allocated memory": alloc_memory}
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
-            del clean_images, batch, noisy_latents, latents, noise, noise_pred, loss
+            del clean_images, batch, noisy_latents, latents, noise, model_pred, loss
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -959,10 +1011,8 @@ def main(args):
 
         accelerator.wait_for_everyone()
 
-        # Generate sample images for visual inspection
-        # sample image from last batch and reconstruct
-        batch = {'input': torch.stack([dataset[i]['input'] for i in range(
-            args.n_samples)]).to(weight_dtype).to(accelerator.device)}
+        timestep_range.advance(epoch, verbose=False) if args.use_timestep_schedule else None
+        
         if accelerator.is_main_process:
             if (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1):
                 unet = accelerator.unwrap_model(model)
@@ -970,48 +1020,31 @@ def main(args):
                 if args.use_ema:
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
-
+                    
                 pipeline = UncondLatentDiffusionPipeline(
-                    vae=vae,
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
+                    vae=vae, 
+                    unet=unet, 
+                    scheduler=noise_scheduler)
 
-                generator = torch.Generator(
-                    device=pipeline.device).manual_seed(0)
-                # run pipeline in inference (sample random noise and denoise)
-                # todo: refactor pipeline to use latents
                 output = pipeline(
-                    # generator=generator,
                     batch_size=1,
-                    num_inference_steps=args.ddpm_num_inference_steps,
+                    num_inference_steps=args.num_inference_steps,
                     output_type="numpy",
-                    batch=batch,
+                    batch=test_batch,
                     noise_timesteps=args.ddpm_noise_timesteps,
                     return_dict=True,
                 )
-
+                
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
+                    
                 images = output['images'].permute(0, 2, 3, 1)
-                # denormalize the images and save to tensorboard
-                images = (images.to(torch.float32) / 2 +
-                          0.5).clamp(0, 1).cpu().numpy()
+                images = (images.to(torch.float32) / 2 + 0.5).clamp(0, 1).cpu().numpy()
                 images_processed = (images * 255).round().astype("uint8")
-                clean_images = output['clean_images'].permute(0, 2, 3, 1)
-                clean_images = (clean_images.to(torch.float32) / 2 +
-                                0.5).clamp(0, 1).cpu().numpy()
-                clean_images = (clean_images * 255).round().astype("uint8")
-
-                # os.makedirs(f"{args.output_dir}/images", exist_ok=True)
-                # [Image.fromarray(clean_images[i]).save(
-                #     f"{args.output_dir}/images/clean_{i}.png") for i in range(len(clean_images))]
-                # input = batch['input'].permute(0, 2, 3, 1)
-                # input = (input.to(torch.float32) / 2 +
-                #          0.5).clamp(0, 1).cpu().numpy()
-                # input = (input * 255).round().astype("uint8")
-                # [Image.fromarray(input[i]).save(f"{args.output_dir}/images/input_{i}.png")
-                #  for i in range(len(input))]
+                clean_images = test_batch["input"].permute(0, 2, 3, 1)
+                clean_images = (clean_images.to(torch.float32) / 2 + 0.5).clamp(0, 1).cpu().numpy()
+                clean_images_processed = (
+                    clean_images * 255).round().astype("uint8")
 
                 if args.logger == "tensorboard":
                     if is_accelerate_version(">=", "0.17.0.dev0"):
@@ -1026,6 +1059,8 @@ def main(args):
                     accelerator.get_tracker("wandb").log(
                         {"test_samples": [wandb.Image(
                             img) for img in images_processed],
+                         "clean_images": [wandb.Image(
+                             img) for img in clean_images_processed],
                          "epoch": epoch},
                         step=global_step,
                     )
@@ -1043,8 +1078,24 @@ def main(args):
                     unet=unet,
                     scheduler=noise_scheduler,
                 )
-
-                pipeline.save_pretrained(args.output_dir)
+                
+                if not args.num_epochs > 1000:
+                    start_time = time.time()
+                    noise_timesteps = 20 if args.use_timestep_schedule else args.ddpm_noise_timesteps
+                    val_auc = evaluate(data='validation', 
+                             pipe=pipeline, 
+                             subtype=args.subtype, 
+                             color_norm=args.color_norm,
+                             num_inference_steps=args.num_inference_steps, 
+                             noise_timesteps=noise_timesteps,)
+                    print("validation time in hrs: ", (time.time() - start_time) / 3600)
+                    
+                    if val_auc > best_auc:
+                        best_auc = val_auc
+                        pipeline.save_pretrained(args.output_dir)
+                        print("saved best model with auc: ", best_auc)
+                else: # debugging, still save every 100 epochs or so 
+                    pipeline.save_pretrained(args.output_dir)
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
@@ -1058,8 +1109,10 @@ def main(args):
                     )
 
     accelerator.end_training()
+    
 
 
 if __name__ == "__main__":
     args = parse_args()
+    set_seed(args.acc_seed)
     main(args)
