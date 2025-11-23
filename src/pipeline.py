@@ -8,6 +8,7 @@ import torch.nn as nn
 from diffusers import (
     VQModel,
     UNet2DModel,
+    AutoencoderKL
 )
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from diffusers.schedulers import (
@@ -30,7 +31,8 @@ class LatentDiffusionPipelineBase(DiffusionPipeline):
         with self.autocast_ctx:
             vae = self.vae
             noise_scheduler = self.scheduler
-            clean_images = batch["input"].to(vae.dtype).to(vae.device)
+            
+            clean_images = batch["input"].to(vae.device)
             posterior = vae.encode(clean_images)
             if hasattr(posterior, "latent_dist"):
                 latents = posterior.latent_dist.sample()
@@ -42,7 +44,7 @@ class LatentDiffusionPipelineBase(DiffusionPipeline):
             latents = (latents - vae_shift) * vae.config.scaling_factor
                 
             # Sample noise that we'll add to the images
-            noise = torch.randn(latents.shape, dtype=vae.dtype,
+            noise = torch.randn(latents.shape, 
                                 device=latents.device)
             bsz = latents.shape[0]
             timesteps = torch.LongTensor(
@@ -60,7 +62,7 @@ class LatentDiffusionPipelineBase(DiffusionPipeline):
                 self.vae.config, "shift_factor") else 0.0
                 
             latents = latents / self.vae.config.scaling_factor + vae_shift
-            latents = latents.to(self.vae.dtype)
+            # latents = latents.to(self.vae.dtype)
             image = self.vae.decode(latents, return_dict=False)[0]
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
         # image = image.cpu().permute(0, 2, 3, 1).float()
@@ -110,7 +112,7 @@ class LatentDiffusionPipelineBase(DiffusionPipeline):
 class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
     def __init__(
             self,
-            vae: VQModel,
+            vae: Union[VQModel, AutoencoderKL],
             scheduler: Union[
                 DDIMScheduler,
                 DDPMScheduler,
@@ -143,33 +145,29 @@ class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             batch_size: int = 1,  # default to generate a single image
             height: Optional[int] = None,
             width: Optional[int] = None,
-            num_inference_steps: Optional[int] = 50,
             generator: Optional[Union[torch.Generator,
                                       List[torch.Generator]]] = None,
             latents: Optional[torch.FloatTensor] = None,
             batch: Optional[dict] = None,
+            num_inference_steps: Optional[int] = 50,
             noise_timesteps: int = 350,
-            output_type: Optional[str] = "pil",
+            output_type: Optional[str] = "numpy",
             return_dict: bool = False,
             eta: Optional[float] = 0.0,
             **kwargs,
     ) -> Union[Tuple, ImagePipelineOutput, Dict[str, torch.Tensor]]:
 
-        # 0. Default height and width to unet
+        self.scheduler.set_timesteps(num_inference_steps)
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
-
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(
                 f"`height` and `width` have to be divisible by 8 but are {height} and {width}."
             )
+        
         with self.autocast_ctx:
             latents, clean_latents = self.prepare_latents(
                 batch, noise_timesteps=noise_timesteps)
-            # latents = self.prepare_latents(batch_size, 3, height, width,
-            #                                self.vae.dtype, self.device, generator, latents)
-
-            self.scheduler.set_timesteps(num_inference_steps)
 
             # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
             extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -195,8 +193,8 @@ class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
 
         if return_dict:
             return {'images': image,
+                    'clean_images': clean_image,
                     'latents': latents,
-                    'clean_latents': clean_latents,
-                    'clean_images': clean_image}
+                    'clean_latents': clean_latents}
 
         return ImagePipelineOutput(images=image)
